@@ -12,6 +12,8 @@
  */
 
 const express = require('express');
+const http = require('http');
+const { WebSocketServer } = require('ws');
 const { spawn, execSync } = require('child_process');
 
 /**
@@ -26,16 +28,52 @@ const app = express();
  */
 const PORT = process.env.PORT || 3000;
 
+/**
+ * Nombre de la red Docker del stack de docker-compose. Los contenedores `linuxserver/ffmpeg`
+ * se lanzan como "hermanos" vía el socket de Docker montado (no anidados dentro de este
+ * contenedor), así que por defecto caerían en la red `bridge` genérica del host y NO podrían
+ * resolver `wd-srs-media-server` por nombre. Hay que unirlos explícitamente a la red que crea
+ * Docker Compose (`{nombre_proyecto}_default`, confirmado con `docker compose config`).
+ * @type {string}
+ */
+const DOCKER_NETWORK = process.env.DOCKER_NETWORK || 'worlddance_default';
+
 // Middleware para procesar cuerpos de solicitud JSON
 app.use(express.json());
 
 /**
  * Almacenamiento en memoria para el rastreo y control de instancias de streaming activas.
  * La clave corresponde al `streamId` (ID del evento) y el valor contiene la información del proceso y contenedor Docker.
- * 
+ *
  * @type {Map<string, {process: ChildProcess, containerName: string, sourceType: string, destinationUrl: string, active: boolean, startedAt: string}>}
  */
 const activeStreams = new Map();
+
+/**
+ * Almacenamiento en memoria de las ingestas activas por WebSocket (navegador -> ffmpeg-manager -> RTMP a SRS).
+ * Independiente de `activeStreams`: esta es la ingesta local (cámara/pantalla), la otra es el reempuje a Kick.
+ *
+ * @type {Map<string, {process: ChildProcess, containerName: string, startedAt: string}>}
+ */
+const activeIngests = new Map();
+
+/**
+ * Detiene y elimina (si existe) el contenedor Docker de ingesta asociado a un streamId.
+ * @param {string} streamId
+ */
+function stopIngest(streamId) {
+  const ingest = activeIngests.get(streamId);
+  if (!ingest) return;
+
+  console.log(`[Ingest - ${streamId}] Deteniendo ingesta y removiendo contenedor ${ingest.containerName}...`);
+  try {
+    ingest.process.stdin.end();
+  } catch (e) {}
+  try {
+    execSync(`docker rm -f ${ingest.containerName}`, { stdio: 'pipe' });
+  } catch (e) {}
+  activeIngests.delete(streamId);
+}
 
 /**
  * @route POST /api/stream/start
@@ -106,6 +144,7 @@ app.post('/api/stream/start', (req, res) => {
     'run',
     '--name', containerName,
     '--rm',
+    '--network', DOCKER_NETWORK,
     '-i',
     'linuxserver/ffmpeg',
     ...inputArgs,
@@ -274,8 +313,120 @@ app.get('/api/streams', (req, res) => {
   return res.status(200).json(streamIds);
 });
 
-// Inicialización de la escucha del servidor HTTP en el puerto configurado
-app.listen(PORT, () => {
+/**
+ * Servidor HTTP subyacente (compartido entre Express y el WebSocketServer de ingesta), necesario
+ * porque `app.listen()` no expone el evento 'upgrade' que requiere un WebSocket.
+ */
+const server = http.createServer(app);
+
+/**
+ * WebSocketServer en modo `noServer`: no escucha un puerto propio, se conecta manualmente al
+ * evento 'upgrade' del servidor HTTP solo para las rutas /ws/ingest/:streamId (ver más abajo).
+ *
+ * `maxPayload` se fija explícitamente en 10MB: los chunks WebM que produce MediaRecorder en el
+ * navegador (sobre todo el primero, que incluye el header EBML/Cues) pueden superar el límite por
+ * defecto de frame de WebSocket (64KB) usado tanto por `ws` como por el gateway/Reactor Netty en
+ * el medio, lo que cerraba la conexión con code 1009 ("Max frame length exceeded"). Debe ser >=
+ * al límite configurado en el api-gateway (spring.cloud.gateway.server.webflux.httpclient.websocket).
+ */
+const WS_MAX_PAYLOAD_BYTES = 10 * 1024 * 1024;
+const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD_BYTES });
+
+/**
+ * @route WS /ws/ingest/:streamId
+ * @description Ingesta de cámara/pantalla por WebSocket (TCP puro) en reemplazo de WHIP/WebRTC:
+ * el navegador graba el MediaStream local con MediaRecorder (contenedor WebM) y envía los chunks
+ * binarios por este socket. Aquí se lanza un contenedor `linuxserver/ffmpeg` que lee esos chunks
+ * por stdin, los transcodifica a H.264/AAC y los reempuja como RTMP hacia SRS
+ * (`rtmp://wd-srs-media-server:1935/live/{streamId}`), exactamente el mismo punto de entrada que
+ * antes alimentaba el puente `rtc_to_rtmp` de SRS. El resto del pipeline (POST /api/stream/start
+ * jalando ese RTMP hacia Kick) no cambia.
+ */
+wss.on('connection', (ws, request, streamId) => {
+  console.log(`[Ingest - ${streamId}] WebSocket de ingesta conectado.`);
+
+  // Si ya había una ingesta previa para este streamId (reconexión del cliente), se reemplaza.
+  stopIngest(streamId);
+
+  const containerName = `ffmpeg-ingest-${streamId}`;
+  try {
+    execSync(`docker rm -f ${containerName}`, { stdio: 'pipe' });
+  } catch (e) {}
+
+  const ffmpegArgs = [
+    'run',
+    '--name', containerName,
+    '--rm',
+    '--network', DOCKER_NETWORK,
+    '-i',
+    'linuxserver/ffmpeg',
+    '-f', 'webm',
+    '-i', 'pipe:0',
+    '-c:v', 'libx264',
+    '-pix_fmt', 'yuv420p',
+    '-preset', 'ultrafast',
+    '-g', '60',
+    '-c:a', 'aac',
+    '-ar', '44100',
+    '-b:a', '128k',
+    '-f', 'flv',
+    `rtmp://wd-srs-media-server:1935/live/${streamId}`
+  ];
+
+  console.log(`[Ingest - ${streamId}] Iniciando contenedor: docker ${ffmpegArgs.join(' ')}`);
+  const ingestProcess = spawn('docker', ffmpegArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
+
+  activeIngests.set(streamId, {
+    process: ingestProcess,
+    containerName,
+    startedAt: new Date().toISOString()
+  });
+
+  ingestProcess.stderr.on('data', (data) => {
+    console.error(`[Ingest - ${streamId}] ${data.toString()}`);
+  });
+
+  ingestProcess.on('close', (code) => {
+    console.log(`[Ingest - ${streamId}] Proceso de ingesta finalizado con código de salida ${code}`);
+    activeIngests.delete(streamId);
+  });
+
+  ingestProcess.on('error', (err) => {
+    console.error(`[Ingest - ${streamId}] No se pudo iniciar el contenedor de ingesta:`, err.message);
+  });
+
+  ws.on('message', (data, isBinary) => {
+    if (!isBinary) return; // ignora mensajes de control/texto, solo interesan los chunks binarios de MediaRecorder
+    if (ingestProcess.stdin.writable) {
+      ingestProcess.stdin.write(data);
+    }
+  });
+
+  ws.on('close', (code) => {
+    console.log(`[Ingest - ${streamId}] WebSocket de ingesta cerrado (code=${code}).`);
+    stopIngest(streamId);
+  });
+
+  ws.on('error', (err) => {
+    console.warn(`[Ingest - ${streamId}] Error en WebSocket de ingesta:`, err.message);
+  });
+});
+
+// Solo se atienden upgrades de conexión para rutas /ws/ingest/:streamId; cualquier otra se rechaza.
+server.on('upgrade', (request, socket, head) => {
+  const match = /^\/ws\/ingest\/([^/?]+)/.exec(request.url || '');
+  if (!match) {
+    socket.destroy();
+    return;
+  }
+  const streamId = match[1];
+  wss.handleUpgrade(request, socket, head, (ws) => {
+    wss.emit('connection', ws, request, streamId);
+  });
+});
+
+// Inicialización de la escucha del servidor HTTP (Express + upgrades WebSocket) en el puerto configurado
+server.listen(PORT, () => {
   console.log(`Servidor de gestión de FFmpeg escuchando en el puerto ${PORT}`);
 });
 
